@@ -12,7 +12,8 @@
 #include <glm/gtc/matrix_transform.hpp>   // rotate, lookAt, perspective
 #include <glm/gtc/type_ptr.hpp>           // value_ptr (matrix -> float* for OpenGL)
 
-#include <algorithm>  // std::min, std::max
+#include <algorithm>  // std::min, std::max, std::fill
+#include <cmath>      // std::sin
 #include <cstdint>    // SIZE_MAX
 #include <cstdio>
 #include <cstdlib>    // std::rand
@@ -39,6 +40,24 @@ static std::string neighborListText(const std::vector<unsigned int>& list) {
         text += ' ';
     }
     return text;
+}
+
+// --- Temperature test patterns (Step 8) ---
+// 'const Mesh&' = read the mesh without copying it; 'std::vector<float>& out'
+// = write into the caller's vector. Same in/out pattern as loadObj().
+
+// Bottom of the bunny cold (0), top hot (1). After normalizeToUnitBox the
+// y coordinates are within -0.5..0.5, so y + 0.5 is within 0..1.
+static void fillHeightGradient(const Mesh& mesh, std::vector<float>& out) {
+    for (size_t i = 0; i < mesh.vertexCount(); ++i)
+        out[i] = mesh.positions[i].y + 0.5f;
+}
+
+// Horizontal bands of heat that travel upwards over time.
+// sin() swings between -1 and 1, so 0.5 + 0.5*sin(...) swings between 0 and 1.
+static void fillWave(const Mesh& mesh, float time, std::vector<float>& out) {
+    for (size_t i = 0; i < mesh.vertexCount(); ++i)
+        out[i] = 0.5f + 0.5f * std::sin(12.0f * mesh.positions[i].y - 4.0f * time);
 }
 
 int main() {
@@ -148,11 +167,38 @@ int main() {
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
     glEnableVertexAttribArray(1);
 
+    // Attribute 2 (aTemperature), new in Step 8: ONE float per vertex, in its own
+    // VBO. The CPU-side copy lives in 'temperature'; temperature[i] belongs to
+    // vertex i, exactly like positions[i] and normals[i].
+    // 0 = cold, 1 = hot (the colour mapping comes in the shader).
+    std::vector<float> temperature(mesh.vertexCount(), 0.0f);  // N floats, all 0
+
+    GLuint temperatureVbo = 0;
+    glGenBuffers(1, &temperatureVbo);
+    glBindBuffer(GL_ARRAY_BUFFER, temperatureVbo);
+    // GL_DYNAMIC_DRAW: a hint that we'll rewrite this buffer often (every frame,
+    // once diffusion runs), unlike positions/normals which never change.
+    glBufferData(GL_ARRAY_BUFFER, temperature.size() * sizeof(float),
+                 temperature.data(), GL_DYNAMIC_DRAW);
+    // size 1 (not 3): a single float per vertex. Stride = sizeof(float) = 4 bytes.
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(float), (void*)0);
+    glEnableVertexAttribArray(2);
+
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size() * sizeof(unsigned int),
                  mesh.indices.data(), GL_STATIC_DRAW);
 
     glBindVertexArray(0);  // unbind so later code can't accidentally modify it
+
+    // Copies the CPU temperatures into the existing GPU buffer.
+    // glBufferSubData overwrites bytes of a buffer that already exists, instead of
+    // re-creating it like glBufferData does. Note: GL_ARRAY_BUFFER is *not* part of
+    // the VAO's state (unlike GL_ELEMENT_ARRAY_BUFFER), so no VAO bind is needed.
+    auto uploadTemperatures = [&]() {
+        glBindBuffer(GL_ARRAY_BUFFER, temperatureVbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, temperature.size() * sizeof(float),
+                        temperature.data());
+    };
 
     // --- Neighbour highlight: a second VAO that draws a few vertices as dots ---
     // It reuses positionVbo (no need to copy the positions again) but has its own
@@ -199,6 +245,10 @@ int main() {
     const GLint uBaseColorLoc  = glGetUniformLocation(program, "uBaseColor");
     const GLint uAmbientLoc    = glGetUniformLocation(program, "uAmbient");
     const GLint uShowNormalLoc = glGetUniformLocation(program, "uShowNormals");
+    const GLint uShowTempLoc   = glGetUniformLocation(program, "uShowTemperature");
+
+    bool showTemperature = true;
+    bool animateWave     = false;
 
     bool  wireframe    = false;
     bool  showNormals  = false;
@@ -284,6 +334,36 @@ int main() {
         // Print the neighbour list: "12 -> 7 9 13 ..."
         ImGui::TextWrapped("%d -> %s", selectedVertex,
                            neighborListText(mesh.neighbors[selectedVertex]).c_str());
+
+        // --- Temperature (Step 8): test patterns until clicking + diffusion exist ---
+        ImGui::SeparatorText("Temperature");
+        ImGui::Checkbox("Show temperature", &showTemperature);
+        // 'dirty' = the CPU copy changed and the GPU copy is now out of date.
+        bool temperatureDirty = false;
+        if (ImGui::Button("All cold")) {
+            std::fill(temperature.begin(), temperature.end(), 0.0f);
+            temperatureDirty = true;
+        }
+        ImGui::SameLine();  // put the next widget on the same row
+        if (ImGui::Button("Height gradient")) {
+            fillHeightGradient(mesh, temperature);
+            temperatureDirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Heat selected")) {
+            temperature[selectedVertex] = 1.0f;
+            for (unsigned int nb : mesh.neighbors[selectedVertex])
+                temperature[nb] = 1.0f;
+            temperatureDirty = true;
+        }
+        ImGui::Checkbox("Animate wave", &animateWave);
+        if (animateWave) {
+            fillWave(mesh, static_cast<float>(now), temperature);
+            temperatureDirty = true;  // new values every frame -> upload every frame
+        }
+        ImGui::Text("T[%d] = %.3f", selectedVertex, temperature[selectedVertex]);
+
+        if (temperatureDirty) uploadTemperatures();
         ImGui::End();
 
         // --- Render ---
@@ -331,6 +411,7 @@ int main() {
         glUniform3fv(uBaseColorLoc, 1, baseColor);  // a float[3] already is a float*
         glUniform1f(uAmbientLoc, ambient);
         glUniform1i(uShowNormalLoc, showNormals);
+        glUniform1i(uShowTempLoc, showTemperature);
 
         // GL_LINE draws only triangle edges; GL_FILL is the normal solid mode.
         glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
@@ -376,6 +457,7 @@ int main() {
     glDeleteBuffers(1, &highlightEbo);
     glDeleteBuffers(1, &positionVbo);
     glDeleteBuffers(1, &normalVbo);
+    glDeleteBuffers(1, &temperatureVbo);
     glDeleteBuffers(1, &ebo);
     glDeleteProgram(program);
 

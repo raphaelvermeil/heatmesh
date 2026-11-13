@@ -8,12 +8,14 @@
 
 in vec3 vWorldPos;
 in vec3 vWorldNormal;
+in float vTemperature;  // 0 = cold, 1 = hot
 out vec4 FragColor;
 
 uniform vec3  uCameraPos;    // world-space camera position (= light position)
 uniform vec3  uBaseColor;    // the surface's own color
 uniform float uAmbient;      // 0..1
 uniform bool  uShowNormals;  // debug view: color = normal direction
+uniform bool  uShowTemperature;
 
 // Flat color: skip lighting and paint everything in one color. Used for the
 // wireframe lines and for the neighbour-highlight points (Step 7).
@@ -46,6 +48,15 @@ void main() {
     vec3 L = normalize(uCameraPos - vWorldPos);  // direction from surface to light
     float diffuse = max(dot(N, L), 0.0);         // facing away from the light -> 0, not negative
 
-    vec3 color = uBaseColor * (uAmbient + (1.0 - uAmbient) * diffuse);
+    // Step 8, temporary: blend the surface color towards red as it heats up.
+    // mix(a, b, t) = a*(1-t) + b*t, so t=0 gives a, t=1 gives b.
+    // Step 9 replaces this with a proper blue -> red colormap.
+    vec3 surface = uBaseColor;
+    if (uShowTemperature) {
+        float t = clamp(vTemperature, 0.0, 1.0);  // keep it inside 0..1 just in case
+        surface = mix(uBaseColor, vec3(1.0, 0.1, 0.05), t);
+    }
+
+    vec3 color = surface * (uAmbient + (1.0 - uAmbient) * diffuse);
     FragColor = vec4(color, 1.0);
 }
