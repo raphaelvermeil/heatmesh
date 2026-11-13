@@ -1,5 +1,5 @@
-// HeatMesh — starter: opens a window, loads OpenGL, shows an ImGui panel.
-// Nothing 3D is drawn yet; that's your first LearnOpenGL step (Hello Triangle).
+// HeatMesh: real-time heat diffusion on a 3D mesh.
+// main.cpp owns the window, the main loop and (for now) the scene setup.
 
 #include <glad/gl.h>      // must come before GLFW
 #include <GLFW/glfw3.h>
@@ -8,86 +8,15 @@
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
 
+#include <glm/glm.hpp>                    // vec3, mat4, ...
+#include <glm/gtc/matrix_transform.hpp>   // rotate, lookAt, perspective
+#include <glm/gtc/type_ptr.hpp>           // value_ptr (matrix -> float* for OpenGL)
+
 #include <cstdio>
 
-// --- Step 1: Hello Triangle --------------------------------------------------
-// Shaders are small programs that run on the GPU. They're written in GLSL
-// (a C-like language) and compiled at runtime by the graphics driver.
-// For now they live in C++ raw string literals: R"( ... )" lets us write
-// multi-line text without escaping quotes or newlines. Step 2 moves them to files.
-
-// Vertex shader: runs once per vertex. Its job is to output gl_Position,
-// the vertex's position in "clip space" (x, y, z each from -1 to 1 are visible).
-static const char* kVertexShaderSrc = R"(
-#version 410 core
-layout(location = 0) in vec3 aPos;    // attribute 0: position (read from the VBO)
-layout(location = 1) in vec3 aColor;  // attribute 1: color
-
-out vec3 vColor;  // passed on to the fragment shader
-
-void main() {
-    vColor = aColor;
-    gl_Position = vec4(aPos, 1.0);
-}
-)";
-
-// Fragment shader: runs once per pixel covered by the triangle. vColor is
-// automatically interpolated between the 3 vertices, giving a smooth gradient.
-static const char* kFragmentShaderSrc = R"(
-#version 410 core
-in vec3 vColor;
-out vec4 FragColor;
-
-void main() {
-    FragColor = vec4(vColor, 1.0);
-}
-)";
-
-// Compiles one shader stage. Returns its OpenGL id (a plain unsigned int handle),
-// or 0 on failure. 'static' here means "only visible inside this .cpp file".
-static GLuint compileShader(GLenum type, const char* source) {
-    GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, nullptr);
-    glCompileShader(shader);
-
-    GLint ok = 0;
-    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "Shader compile error:\n%s\n", log);
-        glDeleteShader(shader);
-        return 0;
-    }
-    return shader;
-}
-
-// Links a vertex + fragment shader into a "program" that the GPU can run.
-static GLuint createProgram(const char* vertexSrc, const char* fragmentSrc) {
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vertexSrc);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentSrc);
-    if (!vs || !fs) return 0;
-
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
-
-    // Once linked, the individual shader objects are no longer needed.
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-
-    GLint ok = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[1024];
-        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
-        std::fprintf(stderr, "Program link error:\n%s\n", log);
-        glDeleteProgram(program);
-        return 0;
-    }
-    return program;
-}
+#include "camera.h"
+#include "mesh.h"
+#include "shader.h"  // our own header: quotes = "look in my project first"
 
 // Prints OpenGL errors as they happen (Windows/Linux drivers; macOS doesn't support it).
 static void GLAPIENTRY onGlDebug(GLenum, GLenum type, GLuint, GLenum severity,
@@ -143,42 +72,94 @@ int main() {
 
     float clearColor[3] = {0.12f, 0.12f, 0.15f};
 
-    // --- Triangle setup (done once, before the loop) ---
-    GLuint program = createProgram(kVertexShaderSrc, kFragmentShaderSrc);
+    // --- Mesh setup (done once, before the loop) ---
+    // PROJECT_DIR comes from CMakeLists.txt (target_compile_definitions), so the
+    // asset and shader files are found no matter which folder the .exe runs from.
+    GLuint program = loadShaderProgram(PROJECT_DIR "/shaders/mesh.vert",
+                                       PROJECT_DIR "/shaders/mesh.frag");
     if (!program) return 1;
 
-    // Vertex data: 3 vertices, each = 3 floats of position + 3 floats of color.
-    // This is "interleaved" data: x y z r g b | x y z r g b | ...
-    float vertices[] = {
-        // position            // color
-        -0.5f, -0.5f, 0.0f,    1.0f, 0.0f, 0.0f,  // bottom left: red
-         0.5f, -0.5f, 0.0f,    0.0f, 1.0f, 0.0f,  // bottom right: green
-         0.0f,  0.5f, 0.0f,    0.0f, 0.0f, 1.0f,  // top: blue
-    };
+    Mesh mesh;
+    if (!loadObj(PROJECT_DIR "/assets/bunny.obj", mesh)) return 1;
+    normalizeToUnitBox(mesh);
+    computeVertexNormals(mesh);  // after normalizing, so normals match the final shape
 
-    // VAO (Vertex Array Object): remembers *how* to read vertex data
-    // (which buffer, which attributes, what layout). Bind it, then configure.
-    // VBO (Vertex Buffer Object): the raw bytes, copied into GPU memory.
-    GLuint vao = 0, vbo = 0;
-    glGenVertexArrays(1, &vao);   // &vao = "address of vao", so GL can write the new id into it
-    glGenBuffers(1, &vbo);
+    const GLsizei indexCount = static_cast<GLsizei>(mesh.indices.size());
+
+    // Same VAO/VBO/EBO idea as the cube, but the data now comes from std::vectors.
+    // .data() gives a pointer to the vector's first element (its storage is one
+    // contiguous block, exactly like a C array), and the byte size is
+    // element count * bytes per element.
+    //
+    // New in Step 6: positions and normals live in two *separate* VBOs instead of
+    // one interleaved buffer like the cube had. Both layouts work; separate buffers
+    // let us later update one attribute (the temperature, Step 8) without touching
+    // the others.
+    GLuint vao = 0, positionVbo = 0, normalVbo = 0, ebo = 0;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &positionVbo);
+    glGenBuffers(1, &normalVbo);
+    glGenBuffers(1, &ebo);
 
     glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 
-    // Attribute 0 (aPos): 3 floats, stride = 6 floats between vertices, starts at byte 0.
-    const GLsizei stride = 6 * sizeof(float);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    // Attribute 0 (aPos): 3 floats. A glm::vec3 is exactly 3 packed floats,
+    // so the stride is sizeof(glm::vec3) = 12 bytes, offset 0.
+    // glVertexAttribPointer records *whichever buffer is bound right now*, so
+    // bind first, then describe.
+    glBindBuffer(GL_ARRAY_BUFFER, positionVbo);
+    glBufferData(GL_ARRAY_BUFFER, mesh.positions.size() * sizeof(glm::vec3),
+                 mesh.positions.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
     glEnableVertexAttribArray(0);
-    // Attribute 1 (aColor): 3 floats, starts after the 3 position floats.
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, (void*)(3 * sizeof(float)));
+
+    // Attribute 1 (aNormal): same layout, from the second buffer.
+    glBindBuffer(GL_ARRAY_BUFFER, normalVbo);
+    glBufferData(GL_ARRAY_BUFFER, mesh.normals.size() * sizeof(glm::vec3),
+                 mesh.normals.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
     glEnableVertexAttribArray(1);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, mesh.indices.size() * sizeof(unsigned int),
+                 mesh.indices.data(), GL_STATIC_DRAW);
 
     glBindVertexArray(0);  // unbind so later code can't accidentally modify it
 
+    // Uniforms are shader variables set from C++ that stay constant for a whole draw call
+    // (unlike attributes, which differ per vertex). We look up their "location" once.
+    const GLint uModelLoc      = glGetUniformLocation(program, "uModel");
+    const GLint uViewLoc       = glGetUniformLocation(program, "uView");
+    const GLint uProjectionLoc = glGetUniformLocation(program, "uProjection");
+    const GLint uWireframeLoc  = glGetUniformLocation(program, "uWireframe");
+    const GLint uNormalMatLoc  = glGetUniformLocation(program, "uNormalMatrix");
+    const GLint uCameraPosLoc  = glGetUniformLocation(program, "uCameraPos");
+    const GLint uBaseColorLoc  = glGetUniformLocation(program, "uBaseColor");
+    const GLint uAmbientLoc    = glGetUniformLocation(program, "uAmbient");
+    const GLint uShowNormalLoc = glGetUniformLocation(program, "uShowNormals");
+
+    bool  wireframe    = false;
+    bool  showNormals  = false;
+    float baseColor[3] = {0.85f, 0.80f, 0.75f};  // light clay
+    float ambient      = 0.15f;
+
+    OrbitCamera camera;  // creates the object, with the default values from camera.h
+
+    bool   rotating      = false;  // off by default now that you can rotate by hand
+    float  rotationSpeed = 45.0f;  // degrees per second
+    float  angle         = 0.0f;   // current rotation, in degrees
+    double lastTime      = glfwGetTime();
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        // Time since last frame ("delta time"). Animating with dt makes the speed
+        // the same on a 60 Hz and a 144 Hz monitor.
+        double now = glfwGetTime();
+        float dt   = static_cast<float>(now - lastTime);
+        lastTime   = now;
+        if (rotating) angle += rotationSpeed * dt;
+
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(window, true);
 
@@ -187,9 +168,39 @@ int main() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // --- Camera input ---
+        // ImGui already listens to the mouse, so we read its state instead of
+        // installing our own GLFW callbacks. 'ImGuiIO&' is a reference: a second
+        // name for ImGui's own object, not a copy.
+        ImGuiIO& io = ImGui::GetIO();
+        // WantCaptureMouse is true when the mouse is over an ImGui window, so
+        // dragging a slider doesn't also spin the camera.
+        if (!io.WantCaptureMouse) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                camera.rotate(io.MouseDelta.x, io.MouseDelta.y);  // pixels moved since last frame
+            if (io.MouseWheel != 0.0f)
+                camera.zoom(io.MouseWheel);
+        }
+
         ImGui::Begin("HeatMesh");
-        ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
+        ImGui::Text("%.1f FPS", io.Framerate);
+        ImGui::Text("%zu vertices, %zu triangles", mesh.vertexCount(), mesh.triangleCount());
         ImGui::ColorEdit3("Background", clearColor);
+        ImGui::Checkbox("Wireframe", &wireframe);
+        ImGui::Checkbox("Rotate", &rotating);
+        ImGui::SliderFloat("Speed (deg/s)", &rotationSpeed, 0.0f, 360.0f);
+
+        ImGui::SeparatorText("Lighting");
+        ImGui::ColorEdit3("Base color", baseColor);
+        ImGui::SliderFloat("Ambient", &ambient, 0.0f, 1.0f);
+        ImGui::Checkbox("Show normals", &showNormals);
+
+        ImGui::SeparatorText("Camera");
+        ImGui::TextDisabled("Left-drag: orbit   Scroll: zoom");
+        ImGui::Text("yaw %.0f  pitch %.0f  dist %.2f",
+                    camera.yaw(), camera.pitch(), camera.distance());
+        ImGui::SliderFloat("FOV", &camera.fovDegrees, 20.0f, 100.0f);
+        if (ImGui::Button("Reset camera")) camera.reset();  // Button returns true when clicked
         ImGui::End();
 
         // --- Render ---
@@ -199,10 +210,51 @@ int main() {
         glClearColor(clearColor[0], clearColor[1], clearColor[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Draw the triangle (before the UI, so the UI draws on top)
+        // Depth test: keep a pixel only if it's closer than what's already there.
+        // Without it, faces are drawn in index order and back faces can cover front ones.
+        // (Enabled every frame because ImGui's renderer toggles GL state too.)
+        glEnable(GL_DEPTH_TEST);
+
+        // --- The 3 matrices (see shaders/mesh.vert for how they're combined) ---
+        // Model: object space -> world space. Spin around the vertical (Y) axis.
+        glm::mat4 model = glm::rotate(glm::mat4(1.0f), glm::radians(angle),
+                                      glm::vec3(0.0f, 1.0f, 0.0f));
+        // View and projection now come from the camera object (see camera.cpp).
+        float aspect = (h > 0) ? static_cast<float>(w) / h : 1.0f;  // h is 0 when minimized
+        glm::mat4 view       = camera.viewMatrix();
+        glm::mat4 projection = camera.projectionMatrix(aspect);
+
+        // Draw the mesh (before the UI, so the UI draws on top)
         glUseProgram(program);
+        glUniform1i(uWireframeLoc, wireframe);  // GLSL bools are set as ints (0/1)
+        // glm::value_ptr gives a float* to the 16 matrix values, in the column-major
+        // order OpenGL expects (so the 'transpose' argument is GL_FALSE).
+        glUniformMatrix4fv(uModelLoc,      1, GL_FALSE, glm::value_ptr(model));
+        glUniformMatrix4fv(uViewLoc,       1, GL_FALSE, glm::value_ptr(view));
+        glUniformMatrix4fv(uProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
+
+        // Normals are directions, not points, so they're transformed with the
+        // inverse-transpose of the model matrix's 3x3 part. For pure rotations this
+        // equals the rotation itself, but it stays correct if you later add a
+        // non-uniform scale (e.g. stretch x by 2), where using 'model' would tilt
+        // the normals off the surface.
+        glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(model)));
+        glUniformMatrix3fv(uNormalMatLoc, 1, GL_FALSE, glm::value_ptr(normalMatrix));
+
+        glm::vec3 cameraPos = camera.position();
+        glUniform3fv(uCameraPosLoc, 1, glm::value_ptr(cameraPos));
+        glUniform3fv(uBaseColorLoc, 1, baseColor);  // a float[3] already is a float*
+        glUniform1f(uAmbientLoc, ambient);
+        glUniform1i(uShowNormalLoc, showNormals);
+
+        // GL_LINE draws only triangle edges; GL_FILL is the normal solid mode.
+        glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+
         glBindVertexArray(vao);
-        glDrawArrays(GL_TRIANGLES, 0, 3);  // 3 vertices starting at index 0
+        // Draw 'indexCount' indices, read from the EBO bound in this VAO, as triangles.
+        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0);
+
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);  // back to normal so the UI isn't wireframe
 
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -212,7 +264,9 @@ int main() {
 
     // Free GPU resources (OpenGL objects aren't freed automatically like C++ locals).
     glDeleteVertexArrays(1, &vao);
-    glDeleteBuffers(1, &vbo);
+    glDeleteBuffers(1, &positionVbo);
+    glDeleteBuffers(1, &normalVbo);
+    glDeleteBuffers(1, &ebo);
     glDeleteProgram(program);
 
     ImGui_ImplOpenGL3_Shutdown();
