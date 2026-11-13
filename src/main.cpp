@@ -12,7 +12,12 @@
 #include <glm/gtc/matrix_transform.hpp>   // rotate, lookAt, perspective
 #include <glm/gtc/type_ptr.hpp>           // value_ptr (matrix -> float* for OpenGL)
 
+#include <algorithm>  // std::min, std::max
+#include <cstdint>    // SIZE_MAX
 #include <cstdio>
+#include <cstdlib>    // std::rand
+#include <string>
+#include <vector>
 
 #include "camera.h"
 #include "mesh.h"
@@ -24,6 +29,16 @@ static void GLAPIENTRY onGlDebug(GLenum, GLenum type, GLuint, GLenum severity,
     if (severity == GL_DEBUG_SEVERITY_NOTIFICATION) return;  // skip info spam
     std::fprintf(stderr, "[GL %s] %s\n",
                  type == GL_DEBUG_TYPE_ERROR ? "ERROR" : "warn", message);
+}
+
+// Turns {7, 9, 13} into the text "7 9 13" for display.
+static std::string neighborListText(const std::vector<unsigned int>& list) {
+    std::string text;
+    for (unsigned int v : list) {
+        text += std::to_string(v);  // number -> text
+        text += ' ';
+    }
+    return text;
 }
 
 int main() {
@@ -83,6 +98,19 @@ int main() {
     if (!loadObj(PROJECT_DIR "/assets/bunny.obj", mesh)) return 1;
     normalizeToUnitBox(mesh);
     computeVertexNormals(mesh);  // after normalizing, so normals match the final shape
+    buildAdjacency(mesh);
+
+    // Neighbour-count statistics, shown in the UI. Most vertices of a typical
+    // triangle mesh have ~6 neighbours; vertices on a hole's border have fewer.
+    size_t minNeighbors = SIZE_MAX, maxNeighbors = 0, totalNeighbors = 0;
+    for (const auto& list : mesh.neighbors) {
+        minNeighbors    = std::min(minNeighbors, list.size());
+        maxNeighbors    = std::max(maxNeighbors, list.size());
+        totalNeighbors += list.size();
+    }
+    const float avgNeighbors = static_cast<float>(totalNeighbors) / mesh.vertexCount();
+    std::printf("Adjacency: %zu..%zu neighbours per vertex, average %.2f\n",
+                minNeighbors, maxNeighbors, avgNeighbors);
 
     const GLsizei indexCount = static_cast<GLsizei>(mesh.indices.size());
 
@@ -126,12 +154,46 @@ int main() {
 
     glBindVertexArray(0);  // unbind so later code can't accidentally modify it
 
+    // --- Neighbour highlight: a second VAO that draws a few vertices as dots ---
+    // It reuses positionVbo (no need to copy the positions again) but has its own
+    // small index buffer: [selected, neighbour1, neighbour2, ...].
+    GLuint highlightVao = 0, highlightEbo = 0;
+    glGenVertexArrays(1, &highlightVao);
+    glGenBuffers(1, &highlightEbo);
+    glBindVertexArray(highlightVao);
+    glBindBuffer(GL_ARRAY_BUFFER, positionVbo);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, highlightEbo);
+    glBindVertexArray(0);
+
+    int selectedVertex = 0;           // int, because ImGui::InputInt works with int
+    GLsizei highlightCount = 0;       // how many indices are in highlightEbo
+
+    // Lambda that refills highlightEbo for a given vertex. Defined here, called
+    // now and again whenever the selection changes.
+    auto uploadHighlight = [&](unsigned int v) {
+        std::vector<unsigned int> ids;
+        ids.push_back(v);                                   // ids[0]: the selected vertex
+        ids.insert(ids.end(), mesh.neighbors[v].begin(),    // ids[1..]: its neighbours
+                   mesh.neighbors[v].end());
+        highlightCount = static_cast<GLsizei>(ids.size());
+
+        // The element buffer binding belongs to the VAO, so bind the VAO first.
+        glBindVertexArray(highlightVao);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, ids.size() * sizeof(unsigned int),
+                     ids.data(), GL_DYNAMIC_DRAW);  // DYNAMIC: we'll rewrite it often
+        glBindVertexArray(0);
+    };
+    uploadHighlight(selectedVertex);
+
     // Uniforms are shader variables set from C++ that stay constant for a whole draw call
     // (unlike attributes, which differ per vertex). We look up their "location" once.
     const GLint uModelLoc      = glGetUniformLocation(program, "uModel");
     const GLint uViewLoc       = glGetUniformLocation(program, "uView");
     const GLint uProjectionLoc = glGetUniformLocation(program, "uProjection");
-    const GLint uWireframeLoc  = glGetUniformLocation(program, "uWireframe");
+    const GLint uFlatEnableLoc = glGetUniformLocation(program, "uUseFlatColor");
+    const GLint uFlatColorLoc  = glGetUniformLocation(program, "uFlatColor");
     const GLint uNormalMatLoc  = glGetUniformLocation(program, "uNormalMatrix");
     const GLint uCameraPosLoc  = glGetUniformLocation(program, "uCameraPos");
     const GLint uBaseColorLoc  = glGetUniformLocation(program, "uBaseColor");
@@ -142,6 +204,7 @@ int main() {
     bool  showNormals  = false;
     float baseColor[3] = {0.85f, 0.80f, 0.75f};  // light clay
     float ambient      = 0.15f;
+    bool  showNeighbors = true;
 
     OrbitCamera camera;  // creates the object, with the default values from camera.h
 
@@ -201,6 +264,26 @@ int main() {
                     camera.yaw(), camera.pitch(), camera.distance());
         ImGui::SliderFloat("FOV", &camera.fovDegrees, 20.0f, 100.0f);
         if (ImGui::Button("Reset camera")) camera.reset();  // Button returns true when clicked
+
+        ImGui::SeparatorText("Adjacency");
+        ImGui::Text("Neighbours per vertex: min %zu, max %zu, avg %.2f",
+                    minNeighbors, maxNeighbors, avgNeighbors);
+        ImGui::Checkbox("Show neighbours", &showNeighbors);
+        // InputInt returns true on the frame the value changes.
+        bool changed = ImGui::InputInt("Vertex", &selectedVertex);
+        if (ImGui::Button("Random vertex")) {
+            selectedVertex = std::rand();  // 0..RAND_MAX; clamped just below
+            changed = true;
+        }
+        if (changed) {
+            // Keep the index valid: 0..vertexCount-1 (the % wraps big random numbers).
+            const int n = static_cast<int>(mesh.vertexCount());
+            selectedVertex = ((selectedVertex % n) + n) % n;  // also wraps -1 to n-1
+            uploadHighlight(static_cast<unsigned int>(selectedVertex));
+        }
+        // Print the neighbour list: "12 -> 7 9 13 ..."
+        ImGui::TextWrapped("%d -> %s", selectedVertex,
+                           neighborListText(mesh.neighbors[selectedVertex]).c_str());
         ImGui::End();
 
         // --- Render ---
@@ -226,7 +309,9 @@ int main() {
 
         // Draw the mesh (before the UI, so the UI draws on top)
         glUseProgram(program);
-        glUniform1i(uWireframeLoc, wireframe);  // GLSL bools are set as ints (0/1)
+        // Wireframe lines are drawn in flat grey. GLSL bools are set as ints (0/1).
+        glUniform1i(uFlatEnableLoc, wireframe);
+        glUniform3f(uFlatColorLoc, 0.9f, 0.9f, 0.9f);
         // glm::value_ptr gives a float* to the 16 matrix values, in the column-major
         // order OpenGL expects (so the 'transpose' argument is GL_FALSE).
         glUniformMatrix4fv(uModelLoc,      1, GL_FALSE, glm::value_ptr(model));
@@ -256,6 +341,29 @@ int main() {
 
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);  // back to normal so the UI isn't wireframe
 
+        // --- Neighbour highlight: selected vertex in red, its neighbours in yellow ---
+        if (showNeighbors) {
+            // Without the depth test, the dots show through the surface, so you
+            // can still see them when they're on the far side of the bunny.
+            glDisable(GL_DEPTH_TEST);
+            glUniform1i(uFlatEnableLoc, 1);
+            glBindVertexArray(highlightVao);
+
+            // Neighbours: indices 1..count-1. The last argument is a *byte offset*
+            // into the index buffer: skip the first index (4 bytes).
+            glPointSize(8.0f);
+            glUniform3f(uFlatColorLoc, 1.0f, 0.85f, 0.1f);
+            glDrawElements(GL_POINTS, highlightCount - 1, GL_UNSIGNED_INT,
+                           (void*)sizeof(unsigned int));
+
+            // Selected vertex: just index 0, drawn last so it's on top.
+            glPointSize(14.0f);
+            glUniform3f(uFlatColorLoc, 1.0f, 0.15f, 0.15f);
+            glDrawElements(GL_POINTS, 1, GL_UNSIGNED_INT, (void*)0);
+
+            glEnable(GL_DEPTH_TEST);
+        }
+
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -264,6 +372,8 @@ int main() {
 
     // Free GPU resources (OpenGL objects aren't freed automatically like C++ locals).
     glDeleteVertexArrays(1, &vao);
+    glDeleteVertexArrays(1, &highlightVao);
+    glDeleteBuffers(1, &highlightEbo);
     glDeleteBuffers(1, &positionVbo);
     glDeleteBuffers(1, &normalVbo);
     glDeleteBuffers(1, &ebo);

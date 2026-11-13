@@ -20,6 +20,10 @@ struct Mesh {
     // normals[i] is the direction vertex i's surface faces (length 1).
     // Filled by computeVertexNormals(); same size as positions.
     std::vector<glm::vec3> normals;
+    // neighbors[i] is the list of vertices connected to vertex i by a triangle
+    // edge, sorted, without duplicates. Filled by buildAdjacency().
+    // A vector *of vectors*: each vertex has its own list, of its own length.
+    std::vector<std::vector<unsigned int>> neighbors;
 
     size_t vertexCount()   const { return positions.size(); }
     size_t triangleCount() const { return indices.size() / 3; }
@@ -37,3 +41,7 @@ void normalizeToUnitBox(Mesh& mesh);
 // Computes one normal per vertex: the average of the normals of the triangles
 // around it, weighted by triangle area. Needed for lighting.
 void computeVertexNormals(Mesh& mesh);
+
+// Builds mesh.neighbors from the triangles: two vertices are neighbours when
+// they share an edge. This is the graph that heat will flow along (Step 11).
+void buildAdjacency(Mesh& mesh);

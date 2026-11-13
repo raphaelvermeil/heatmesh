@@ -4,7 +4,7 @@
 
 #include <tiny_obj_loader.h>
 
-#include <algorithm>  // std::max
+#include <algorithm>  // std::max, std::sort, std::unique
 #include <cstdio>
 
 bool loadObj(const std::string& path, Mesh& mesh) {
@@ -101,5 +101,39 @@ void computeVertexNormals(Mesh& mesh) {
         // A vertex used by no triangle (or only by degenerate, zero-area ones)
         // has a zero sum; normalizing it would divide by zero, so pick any direction.
         n = (len > 0.0f) ? n / len : glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+}
+
+void buildAdjacency(Mesh& mesh) {
+    // One empty list per vertex. '{}' here means "an empty std::vector<unsigned int>".
+    mesh.neighbors.assign(mesh.positions.size(), {});
+
+    // A lambda is a small function written inline. [&] means it can use the
+    // variables around it (here: mesh) by reference. Calling link(a, b) records
+    // the edge in *both* directions, since "a is next to b" means "b is next to a".
+    auto link = [&](unsigned int a, unsigned int b) {
+        mesh.neighbors[a].push_back(b);
+        mesh.neighbors[b].push_back(a);
+    };
+
+    // Pass 1: every triangle a-b-c has 3 edges: a-b, b-c, c-a.
+    for (size_t t = 0; t < mesh.triangleCount(); ++t) {
+        unsigned int a = mesh.indices[3 * t + 0];
+        unsigned int b = mesh.indices[3 * t + 1];
+        unsigned int c = mesh.indices[3 * t + 2];
+        link(a, b);
+        link(b, c);
+        link(c, a);
+    }
+
+    // Pass 2: an edge inside the surface belongs to 2 triangles, so it was added
+    // twice. Remove the duplicates with the classic "sort, then unique + erase":
+    //   sort:   [3, 1, 3, 2] -> [1, 2, 3, 3]   (duplicates are now side by side)
+    //   unique: moves the distinct values to the front -> [1, 2, 3, ?] and returns
+    //           an iterator to the '?' (the start of the leftover junk)
+    //   erase:  cuts the vector from there to the end  -> [1, 2, 3]
+    for (auto& list : mesh.neighbors) {
+        std::sort(list.begin(), list.end());
+        list.erase(std::unique(list.begin(), list.end()), list.end());
     }
 }

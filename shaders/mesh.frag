@@ -13,10 +13,21 @@ out vec4 FragColor;
 uniform vec3  uCameraPos;    // world-space camera position (= light position)
 uniform vec3  uBaseColor;    // the surface's own color
 uniform float uAmbient;      // 0..1
-uniform bool  uWireframe;
 uniform bool  uShowNormals;  // debug view: color = normal direction
 
+// Flat color: skip lighting and paint everything in one color. Used for the
+// wireframe lines and for the neighbour-highlight points (Step 7).
+uniform bool  uUseFlatColor;
+uniform vec3  uFlatColor;
+
 void main() {
+    // Checked first: the highlight points have no normal attribute, so the
+    // lighting code below would produce garbage for them.
+    if (uUseFlatColor) {
+        FragColor = vec4(uFlatColor, 1.0);
+        return;
+    }
+
     // Interpolation between the 3 vertices shortens the normal slightly,
     // so normalize again per pixel.
     vec3 N = normalize(vWorldNormal);
@@ -36,6 +47,5 @@ void main() {
     float diffuse = max(dot(N, L), 0.0);         // facing away from the light -> 0, not negative
 
     vec3 color = uBaseColor * (uAmbient + (1.0 - uAmbient) * diffuse);
-    if (uWireframe) color = vec3(0.9);
     FragColor = vec4(color, 1.0);
 }
