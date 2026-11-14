@@ -13,6 +13,7 @@
 #include <glm/gtc/type_ptr.hpp>           // value_ptr (matrix -> float* for OpenGL)
 
 #include <algorithm>  // std::min, std::max, std::fill
+#include <chrono>     // timing the diffusion
 #include <cmath>      // std::sin
 #include <cstdint>    // SIZE_MAX
 #include <cstdio>
@@ -23,6 +24,7 @@
 
 #include "camera.h"
 #include "colormap.h"
+#include "diffusion.h"
 #include "mesh.h"
 #include "picking.h"
 #include "shader.h"  // our own header: quotes = "look in my project first"
@@ -63,20 +65,20 @@ static void fillWave(const Mesh& mesh, float time, std::vector<float>& out) {
         out[i] = 0.5f + 0.5f * std::sin(12.0f * mesh.positions[i].y - 4.0f * time);
 }
 
-// --- Heat brush (Step 10) ---
-// Heats every vertex within 'radius' of 'center': 1 at the center, fading
+// --- Heat brush (Steps 10 + 12) ---
+// Heats every vertex within 'radius' of 'center': 'amount' at the center, fading
 // linearly to 0 at the edge. std::max keeps the hotter value, so brushing
 // over an already-hot area never cools it down.
-// The nearest vertex is always set to 1, so even radius 0 heats something.
+// The nearest vertex always gets 'amount', so even radius 0 heats something.
 static void applyHeatBrush(const Mesh& mesh, glm::vec3 center, unsigned int nearestVertex,
-                           float radius, std::vector<float>& temperature) {
-    temperature[nearestVertex] = 1.0f;
+                           float radius, float amount, std::vector<float>& temperature) {
+    temperature[nearestVertex] = std::max(temperature[nearestVertex], amount);
     if (radius <= 0.0f) return;
 
     for (size_t i = 0; i < mesh.vertexCount(); ++i) {
         float d = glm::distance(mesh.positions[i], center);
         if (d < radius) {
-            float heat = 1.0f - d / radius;  // d = 0 -> 1, d = radius -> 0
+            float heat = amount * (1.0f - d / radius);  // d = 0 -> amount, d = radius -> 0
             temperature[i] = std::max(temperature[i], heat);
         }
     }
@@ -310,7 +312,16 @@ int main() {
     int  isolineCount    = 10;
 
     float brushRadius = 0.04f;    // in object units; the bunny is 1 unit wide
+    float heatAmount  = 1.0f;     // brush temperature at its center (Step 12)
     std::optional<Hit> lastHit;   // empty until the first successful pick
+
+    // --- Simulation state (Steps 11-12) ---
+    bool  paused           = false;
+    bool  stepOnce         = false;   // set by the "Step" button, consumed next frame
+    float diffusionSpeed   = 150.0f;  // k in the README formula, per second
+    int   maxStepsPerFrame = 50;      // safety cap on the work done per frame
+    float diffusionMs      = 0.0f;    // time the last diffusion took, for the panel
+    std::vector<float> scratch;       // work buffer for diffuse(), reused every frame
 
     bool  wireframe    = false;
     bool  showNormals  = false;
@@ -386,7 +397,8 @@ int main() {
 
             if (std::optional<Hit> hit = raycastMesh(mesh, ray)) {  // declare + test in one go
                 lastHit = hit;
-                applyHeatBrush(mesh, hit->point, hit->nearestVertex, brushRadius, temperature);
+                applyHeatBrush(mesh, hit->point, hit->nearestVertex, brushRadius, heatAmount,
+                               temperature);
                 temperatureDirty = true;
 
                 // Also select the vertex, so the Adjacency section and the dots follow the mouse.
@@ -397,79 +409,93 @@ int main() {
             }
         }
 
+        // --- Keyboard shortcut (Step 12): Space toggles pause ---
+        // WantCaptureKeyboard is true while you type in an ImGui field (e.g. the
+        // vertex number), so a Space typed there doesn't also pause.
+        // The 'false' = don't repeat while the key is held down.
+        if (!io.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+            paused = !paused;
+
+        // --- Diffusion (Step 11) ---
+        int stepsThisFrame = 0;
+        if (!paused || stepOnce) {
+            // How much diffusion this frame: k * dt. While paused, "Step" does
+            // exactly one safe step instead.
+            // dt is capped at 0.1 s: if the window freezes (e.g. while you drag it),
+            // the next frame shouldn't try to catch up on a whole second at once.
+            const float amount = paused ? kMaxStepAmount
+                                        : diffusionSpeed * std::min(dt, 0.1f);
+
+            // std::chrono: C++'s clock library. steady_clock never jumps (unlike
+            // the wall clock), which is what you want for measuring durations.
+            auto start = std::chrono::steady_clock::now();
+            stepsThisFrame = diffuse(mesh, temperature, scratch, amount, maxStepsPerFrame);
+            auto end = std::chrono::steady_clock::now();
+            // duration<float, std::milli> = "a duration, as a float, in milliseconds".
+            diffusionMs = std::chrono::duration<float, std::milli>(end - start).count();
+
+            if (stepsThisFrame > 0) temperatureDirty = true;
+            stepOnce = false;  // a single step is used up
+        }
+
+        // Statistics shown in the panel. The sum is a double: adding 35,947 floats
+        // into a float loses precision as the total grows.
+        float  maxT      = 0.0f;
+        double totalHeat = 0.0;
+        for (float t : temperature) {
+            maxT       = std::max(maxT, t);
+            totalHeat += t;
+        }
+
         ImGui::Begin("HeatMesh");
-        ImGui::Text("%.1f FPS", io.Framerate);
-        ImGui::Text("%zu vertices, %zu triangles", mesh.vertexCount(), mesh.triangleCount());
-        ImGui::ColorEdit3("Background", clearColor);
-        ImGui::Checkbox("Wireframe", &wireframe);
-        ImGui::Checkbox("Rotate", &rotating);
-        ImGui::SliderFloat("Speed (deg/s)", &rotationSpeed, 0.0f, 360.0f);
+        ImGui::Text("%.1f FPS  |  %zu vertices, %zu triangles",
+                    io.Framerate, mesh.vertexCount(), mesh.triangleCount());
 
-        ImGui::SeparatorText("Lighting");
-        ImGui::ColorEdit3("Base color", baseColor);
-        ImGui::SliderFloat("Ambient", &ambient, 0.0f, 1.0f);
-        ImGui::Checkbox("Show normals", &showNormals);
-
-        ImGui::SeparatorText("Camera");
-        ImGui::TextDisabled("Left-drag: orbit   Scroll: zoom");
-        ImGui::Text("yaw %.0f  pitch %.0f  dist %.2f",
-                    camera.yaw(), camera.pitch(), camera.distance());
-        ImGui::SliderFloat("FOV", &camera.fovDegrees, 20.0f, 100.0f);
-        if (ImGui::Button("Reset camera")) camera.reset();  // Button returns true when clicked
-
-        ImGui::SeparatorText("Adjacency");
-        ImGui::Text("Neighbours per vertex: min %zu, max %zu, avg %.2f",
-                    minNeighbors, maxNeighbors, avgNeighbors);
-        ImGui::Checkbox("Show neighbours", &showNeighbors);
-        // InputInt returns true on the frame the value changes.
-        bool changed = ImGui::InputInt("Vertex", &selectedVertex);
-        if (ImGui::Button("Random vertex")) {
-            selectedVertex = std::rand();  // 0..RAND_MAX; clamped just below
-            changed = true;
+        // ===== Simulation (Steps 11-12): always visible, used the most =====
+        ImGui::SeparatorText("Simulation");
+        if (ImGui::Button(paused ? "Play " : "Pause")) paused = !paused;  // label follows the state
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!paused);  // greyed out and unclickable while running
+        if (ImGui::Button("Step")) stepOnce = true;  // takes effect next frame (see above)
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Reset")) {
+            std::fill(temperature.begin(), temperature.end(), 0.0f);
+            temperatureDirty = true;
         }
-        if (changed) {
-            // Keep the index valid: 0..vertexCount-1 (the % wraps big random numbers).
-            const int n = static_cast<int>(mesh.vertexCount());
-            selectedVertex = ((selectedVertex % n) + n) % n;  // also wraps -1 to n-1
-            uploadHighlight(static_cast<unsigned int>(selectedVertex));
-        }
-        // Print the neighbour list: "12 -> 7 9 13 ..."
-        ImGui::TextWrapped("%d -> %s", selectedVertex,
-                           neighborListText(mesh.neighbors[selectedVertex]).c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("(Space: pause)");
 
-        // --- Heat brush (Step 10) ---
+        // Logarithmic: 1..10, 10..100, 100..1000 each take the same slider width,
+        // so you can be precise at low speeds and still reach high ones.
+        ImGui::SliderFloat("Diffusion speed", &diffusionSpeed, 1.0f, 3000.0f, "%.0f",
+                           ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderInt("Max steps / frame", &maxStepsPerFrame, 1, 200);
+
+        if (paused) {
+            ImGui::TextDisabled("Paused");
+        } else {
+            ImGui::Text("%d steps this frame, %.2f ms", stepsThisFrame, diffusionMs);
+            if (stepsThisFrame >= maxStepsPerFrame)
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                                   "Step limit reached: running slower than real time");
+        }
+        ImGui::Text("Max T: %.3f   Total heat: %.2f", maxT, totalHeat);
+
+        // ===== Heat brush (Steps 10 + 12) =====
         ImGui::SeparatorText("Heat brush");
         ImGui::TextDisabled("Right-click / right-drag on the mesh to heat it");
+        ImGui::SliderFloat("Heat amount", &heatAmount, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Radius", &brushRadius, 0.0f, 0.15f, "%.3f");
         if (lastHit) {
-            ImGui::Text("Last hit: triangle %zu, vertex %u", lastHit->triangle,
-                        lastHit->nearestVertex);
-            ImGui::Text("  at (%.3f, %.3f, %.3f), distance %.3f", lastHit->point.x,
-                        lastHit->point.y, lastHit->point.z, lastHit->t);
+            ImGui::Text("Last hit: vertex %u, T = %.3f", lastHit->nearestVertex,
+                        temperature[lastHit->nearestVertex]);
         } else {
             ImGui::TextDisabled("No hit yet");
         }
 
-        // --- Temperature (Step 8): test patterns ---
-        ImGui::SeparatorText("Temperature");
-        ImGui::Checkbox("Show temperature", &showTemperature);
-        if (ImGui::Button("All cold")) {
-            std::fill(temperature.begin(), temperature.end(), 0.0f);
-            temperatureDirty = true;
-        }
-        ImGui::SameLine();  // put the next widget on the same row
-        if (ImGui::Button("Height gradient")) {
-            fillHeightGradient(mesh, temperature);
-            temperatureDirty = true;
-        }
-        ImGui::Checkbox("Animate wave", &animateWave);
-        if (animateWave) {
-            fillWave(mesh, static_cast<float>(now), temperature);
-            temperatureDirty = true;  // new values every frame -> upload every frame
-        }
-        ImGui::Text("T[%d] = %.3f", selectedVertex, temperature[selectedVertex]);
-
-        // --- Colormap (Step 9) ---
+        // ===== Colormap (Step 9) =====
+        ImGui::SeparatorText("Colormap");
         // BeginCombo/EndCombo: a drop-down list. The preview text is the current name.
         if (ImGui::BeginCombo("Colormap", kColormaps[colormapIndex].name)) {
             for (int i = 0; i < static_cast<int>(kColormaps.size()); ++i) {
@@ -479,9 +505,70 @@ int main() {
             }
             ImGui::EndCombo();
         }
+        ImGui::Checkbox("Show temperature", &showTemperature);
+        ImGui::SameLine();
         ImGui::Checkbox("Isolines", &isolines);
         if (isolines) ImGui::SliderInt("Bands", &isolineCount, 2, 30);
         drawColormapLegend(kColormaps[colormapIndex]);
+
+        // ===== Everything else: collapsible, closed by default =====
+        // CollapsingHeader returns true while the section is open.
+        if (ImGui::CollapsingHeader("Display")) {
+            ImGui::ColorEdit3("Background", clearColor);
+            ImGui::Checkbox("Wireframe", &wireframe);
+            ImGui::Checkbox("Rotate", &rotating);
+            ImGui::SliderFloat("Speed (deg/s)", &rotationSpeed, 0.0f, 360.0f);
+        }
+
+        if (ImGui::CollapsingHeader("Lighting")) {
+            ImGui::ColorEdit3("Base color", baseColor);
+            ImGui::SliderFloat("Ambient", &ambient, 0.0f, 1.0f);
+            ImGui::Checkbox("Show normals", &showNormals);
+        }
+
+        if (ImGui::CollapsingHeader("Camera")) {
+            ImGui::TextDisabled("Left-drag: orbit   Scroll: zoom");
+            ImGui::Text("yaw %.0f  pitch %.0f  dist %.2f",
+                        camera.yaw(), camera.pitch(), camera.distance());
+            ImGui::SliderFloat("FOV", &camera.fovDegrees, 20.0f, 100.0f);
+            if (ImGui::Button("Reset camera")) camera.reset();  // Button returns true when clicked
+        }
+
+        if (ImGui::CollapsingHeader("Adjacency")) {
+            ImGui::Text("Neighbours per vertex: min %zu, max %zu, avg %.2f",
+                        minNeighbors, maxNeighbors, avgNeighbors);
+            ImGui::Checkbox("Show neighbours", &showNeighbors);
+            // InputInt returns true on the frame the value changes.
+            bool changed = ImGui::InputInt("Vertex", &selectedVertex);
+            if (ImGui::Button("Random vertex")) {
+                selectedVertex = std::rand();  // 0..RAND_MAX; clamped just below
+                changed = true;
+            }
+            if (changed) {
+                // Keep the index valid: 0..vertexCount-1 (the % wraps big random numbers).
+                const int n = static_cast<int>(mesh.vertexCount());
+                selectedVertex = ((selectedVertex % n) + n) % n;  // also wraps -1 to n-1
+                uploadHighlight(static_cast<unsigned int>(selectedVertex));
+            }
+            // Print the neighbour list: "12 -> 7 9 13 ..."
+            ImGui::TextWrapped("%d -> %s", selectedVertex,
+                               neighborListText(mesh.neighbors[selectedVertex]).c_str());
+            ImGui::Text("T[%d] = %.3f", selectedVertex, temperature[selectedVertex]);
+        }
+
+        if (ImGui::CollapsingHeader("Test patterns")) {
+            if (ImGui::Button("Height gradient")) {
+                fillHeightGradient(mesh, temperature);
+                temperatureDirty = true;
+            }
+            // The wave overwrites every temperature each frame, so diffusion has
+            // no visible effect while it's on.
+            ImGui::Checkbox("Animate wave", &animateWave);
+        }
+        if (animateWave) {
+            fillWave(mesh, static_cast<float>(now), temperature);
+            temperatureDirty = true;  // new values every frame -> upload every frame
+        }
 
         if (temperatureDirty) uploadTemperatures();
         ImGui::End();
