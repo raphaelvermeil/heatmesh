@@ -17,10 +17,24 @@ uniform float uAmbient;      // 0..1
 uniform bool  uShowNormals;  // debug view: color = normal direction
 uniform bool  uShowTemperature;
 
+// Step 9: the colormap's 5 stops, sent from C++ (see src/colormap.h).
+// A uniform *array*: uColormap[0] .. uColormap[4].
+uniform vec3  uColormap[5];
+uniform bool  uIsolines;      // draw thin dark lines at T = 0.1, 0.2, ...
+uniform float uIsolineCount;  // how many bands between 0 and 1 (10 -> a line every 0.1)
+
 // Flat color: skip lighting and paint everything in one color. Used for the
 // wireframe lines and for the neighbour-highlight points (Step 7).
 uniform bool  uUseFlatColor;
 uniform vec3  uFlatColor;
+
+// Temperature -> colour. Same maths as sampleColormap() in src/colormap.h.
+vec3 colormap(float t) {
+    float x = clamp(t, 0.0, 1.0) * 4.0;    // 0..4: which segment, and how far into it
+    int   i = min(int(floor(x)), 3);       // segment 0..3 (t = 1 stays in segment 3)
+    float f = x - float(i);                // 0..1 inside the segment
+    return mix(uColormap[i], uColormap[i + 1], f);
+}
 
 void main() {
     // Checked first: the highlight points have no normal attribute, so the
@@ -48,13 +62,22 @@ void main() {
     vec3 L = normalize(uCameraPos - vWorldPos);  // direction from surface to light
     float diffuse = max(dot(N, L), 0.0);         // facing away from the light -> 0, not negative
 
-    // Step 8, temporary: blend the surface color towards red as it heats up.
-    // mix(a, b, t) = a*(1-t) + b*t, so t=0 gives a, t=1 gives b.
-    // Step 9 replaces this with a proper blue -> red colormap.
     vec3 surface = uBaseColor;
     if (uShowTemperature) {
-        float t = clamp(vTemperature, 0.0, 1.0);  // keep it inside 0..1 just in case
-        surface = mix(uBaseColor, vec3(1.0, 0.1, 0.05), t);
+        surface = colormap(vTemperature);
+
+        if (uIsolines) {
+            // Isolines = lines of equal temperature, like contour lines on a map.
+            // v counts bands: T = 0.23 with 10 bands -> v = 2.3.
+            float v = vTemperature * uIsolineCount;
+            // Distance to the nearest whole number (0 at 2.0 or 3.0, 0.5 at 2.5).
+            float dist = abs(fract(v + 0.5) - 0.5);
+            // fwidth(v) = how much v changes from this pixel to the next. Dividing
+            // by it measures the distance in *pixels*, so lines stay ~1 pixel wide
+            // whether you zoom in or out.
+            float line = 1.0 - clamp(dist / fwidth(v), 0.0, 1.0);
+            surface = mix(surface, vec3(0.05), 0.7 * line);
+        }
     }
 
     vec3 color = surface * (uAmbient + (1.0 - uAmbient) * diffuse);

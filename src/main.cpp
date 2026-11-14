@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "colormap.h"
 #include "mesh.h"
 #include "shader.h"  // our own header: quotes = "look in my project first"
 
@@ -58,6 +59,36 @@ static void fillHeightGradient(const Mesh& mesh, std::vector<float>& out) {
 static void fillWave(const Mesh& mesh, float time, std::vector<float>& out) {
     for (size_t i = 0; i < mesh.vertexCount(); ++i)
         out[i] = 0.5f + 0.5f * std::sin(12.0f * mesh.positions[i].y - 4.0f * time);
+}
+
+// Draws a horizontal colour bar for the colormap inside the current ImGui window,
+// with "cold" / "hot" labels under it.
+static void drawColormapLegend(const Colormap& cm) {
+    const float  width  = ImGui::GetContentRegionAvail().x;  // full width of the panel
+    const float  height = 16.0f;
+    const ImVec2 origin = ImGui::GetCursorScreenPos();       // top-left corner, in pixels
+    ImDrawList*  draw   = ImGui::GetWindowDrawList();
+
+    // A smooth bar = many thin rectangles, each with a left and a right colour.
+    const int segments = 64;
+    for (int s = 0; s < segments; ++s) {
+        float t0 = static_cast<float>(s) / segments;
+        float t1 = static_cast<float>(s + 1) / segments;
+        glm::vec3 c0 = sampleColormap(cm, t0);
+        glm::vec3 c1 = sampleColormap(cm, t1);
+        ImU32 left  = ImGui::ColorConvertFloat4ToU32(ImVec4(c0.r, c0.g, c0.b, 1.0f));
+        ImU32 right = ImGui::ColorConvertFloat4ToU32(ImVec4(c1.r, c1.g, c1.b, 1.0f));
+        ImVec2 a(origin.x + width * t0, origin.y);            // top-left of this slice
+        ImVec2 b(origin.x + width * t1, origin.y + height);   // bottom-right
+        // Corner colours in order: top-left, top-right, bottom-right, bottom-left.
+        draw->AddRectFilledMultiColor(a, b, left, right, right, left);
+    }
+    // We drew "by hand", so tell ImGui's layout that this space is now used.
+    ImGui::Dummy(ImVec2(width, height));
+
+    ImGui::TextUnformatted("0 cold");
+    ImGui::SameLine(width - ImGui::CalcTextSize("hot 1").x);  // right-align the label
+    ImGui::TextUnformatted("hot 1");
 }
 
 int main() {
@@ -247,8 +278,15 @@ int main() {
     const GLint uShowNormalLoc = glGetUniformLocation(program, "uShowNormals");
     const GLint uShowTempLoc   = glGetUniformLocation(program, "uShowTemperature");
 
+    const GLint uColormapLoc   = glGetUniformLocation(program, "uColormap");  // = element [0]
+    const GLint uIsolinesLoc   = glGetUniformLocation(program, "uIsolines");
+    const GLint uIsoCountLoc   = glGetUniformLocation(program, "uIsolineCount");
+
     bool showTemperature = true;
     bool animateWave     = false;
+    int  colormapIndex   = 0;      // which entry of kColormaps is active
+    bool isolines        = false;
+    int  isolineCount    = 10;
 
     bool  wireframe    = false;
     bool  showNormals  = false;
@@ -363,6 +401,20 @@ int main() {
         }
         ImGui::Text("T[%d] = %.3f", selectedVertex, temperature[selectedVertex]);
 
+        // --- Colormap (Step 9) ---
+        // BeginCombo/EndCombo: a drop-down list. The preview text is the current name.
+        if (ImGui::BeginCombo("Colormap", kColormaps[colormapIndex].name)) {
+            for (int i = 0; i < static_cast<int>(kColormaps.size()); ++i) {
+                // Selectable returns true when clicked; the 2nd argument highlights the current one.
+                if (ImGui::Selectable(kColormaps[i].name, i == colormapIndex))
+                    colormapIndex = i;
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::Checkbox("Isolines", &isolines);
+        if (isolines) ImGui::SliderInt("Bands", &isolineCount, 2, 30);
+        drawColormapLegend(kColormaps[colormapIndex]);
+
         if (temperatureDirty) uploadTemperatures();
         ImGui::End();
 
@@ -412,6 +464,12 @@ int main() {
         glUniform1f(uAmbientLoc, ambient);
         glUniform1i(uShowNormalLoc, showNormals);
         glUniform1i(uShowTempLoc, showTemperature);
+        // Upload all 5 stops in one call: count = 5 vec3s, read from consecutive
+        // memory starting at stops[0] (std::array is contiguous, like a C array).
+        glUniform3fv(uColormapLoc, kColormapStops,
+                     glm::value_ptr(kColormaps[colormapIndex].stops[0]));
+        glUniform1i(uIsolinesLoc, isolines);
+        glUniform1f(uIsoCountLoc, static_cast<float>(isolineCount));
 
         // GL_LINE draws only triangle edges; GL_FILL is the normal solid mode.
         glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
