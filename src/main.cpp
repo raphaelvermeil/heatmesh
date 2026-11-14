@@ -17,12 +17,14 @@
 #include <cstdint>    // SIZE_MAX
 #include <cstdio>
 #include <cstdlib>    // std::rand
+#include <optional>   // std::optional
 #include <string>
 #include <vector>
 
 #include "camera.h"
 #include "colormap.h"
 #include "mesh.h"
+#include "picking.h"
 #include "shader.h"  // our own header: quotes = "look in my project first"
 
 // Prints OpenGL errors as they happen (Windows/Linux drivers; macOS doesn't support it).
@@ -59,6 +61,25 @@ static void fillHeightGradient(const Mesh& mesh, std::vector<float>& out) {
 static void fillWave(const Mesh& mesh, float time, std::vector<float>& out) {
     for (size_t i = 0; i < mesh.vertexCount(); ++i)
         out[i] = 0.5f + 0.5f * std::sin(12.0f * mesh.positions[i].y - 4.0f * time);
+}
+
+// --- Heat brush (Step 10) ---
+// Heats every vertex within 'radius' of 'center': 1 at the center, fading
+// linearly to 0 at the edge. std::max keeps the hotter value, so brushing
+// over an already-hot area never cools it down.
+// The nearest vertex is always set to 1, so even radius 0 heats something.
+static void applyHeatBrush(const Mesh& mesh, glm::vec3 center, unsigned int nearestVertex,
+                           float radius, std::vector<float>& temperature) {
+    temperature[nearestVertex] = 1.0f;
+    if (radius <= 0.0f) return;
+
+    for (size_t i = 0; i < mesh.vertexCount(); ++i) {
+        float d = glm::distance(mesh.positions[i], center);
+        if (d < radius) {
+            float heat = 1.0f - d / radius;  // d = 0 -> 1, d = radius -> 0
+            temperature[i] = std::max(temperature[i], heat);
+        }
+    }
 }
 
 // Draws a horizontal colour bar for the colormap inside the current ImGui window,
@@ -288,6 +309,9 @@ int main() {
     bool isolines        = false;
     int  isolineCount    = 10;
 
+    float brushRadius = 0.04f;    // in object units; the bunny is 1 unit wide
+    std::optional<Hit> lastHit;   // empty until the first successful pick
+
     bool  wireframe    = false;
     bool  showNormals  = false;
     float baseColor[3] = {0.85f, 0.80f, 0.75f};  // light clay
@@ -333,6 +357,46 @@ int main() {
                 camera.zoom(io.MouseWheel);
         }
 
+        // --- The 3 matrices (see shaders/mesh.vert for how they're combined) ---
+        // Computed here, before the UI, because picking (just below) needs them too.
+        int w, h;
+        glfwGetFramebufferSize(window, &w, &h);
+        // Model: object space -> world space. Spin around the vertical (Y) axis.
+        glm::mat4 model = glm::rotate(glm::mat4(1.0f), glm::radians(angle),
+                                      glm::vec3(0.0f, 1.0f, 0.0f));
+        // View and projection come from the camera object (see camera.cpp).
+        float aspect = (h > 0) ? static_cast<float>(w) / h : 1.0f;  // h is 0 when minimized
+        glm::mat4 view       = camera.viewMatrix();
+        glm::mat4 projection = camera.projectionMatrix(aspect);
+
+        // 'dirty' = the CPU copy of the temperatures changed and the GPU copy is
+        // now out of date. Anything below that changes 'temperature' sets it.
+        bool temperatureDirty = false;
+
+        // --- Picking (Step 10): hold the RIGHT mouse button to heat the surface ---
+        // (Left is taken by the orbit camera.)
+        if (!io.WantCaptureMouse && ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
+            // The inverse of the full chain object -> clip, so the ray comes out in
+            // object space: the same space as mesh.positions. No need to rotate
+            // 35,947 vertices; we "un-rotate" one ray instead.
+            glm::mat4 invMvp = glm::inverse(projection * view * model);
+            // io.MousePos and io.DisplaySize are both in window coordinates.
+            Ray ray = rayFromMouse(glm::vec2(io.MousePos.x, io.MousePos.y),
+                                   glm::vec2(io.DisplaySize.x, io.DisplaySize.y), invMvp);
+
+            if (std::optional<Hit> hit = raycastMesh(mesh, ray)) {  // declare + test in one go
+                lastHit = hit;
+                applyHeatBrush(mesh, hit->point, hit->nearestVertex, brushRadius, temperature);
+                temperatureDirty = true;
+
+                // Also select the vertex, so the Adjacency section and the dots follow the mouse.
+                if (static_cast<int>(hit->nearestVertex) != selectedVertex) {
+                    selectedVertex = static_cast<int>(hit->nearestVertex);
+                    uploadHighlight(hit->nearestVertex);
+                }
+            }
+        }
+
         ImGui::Begin("HeatMesh");
         ImGui::Text("%.1f FPS", io.Framerate);
         ImGui::Text("%zu vertices, %zu triangles", mesh.vertexCount(), mesh.triangleCount());
@@ -373,11 +437,22 @@ int main() {
         ImGui::TextWrapped("%d -> %s", selectedVertex,
                            neighborListText(mesh.neighbors[selectedVertex]).c_str());
 
-        // --- Temperature (Step 8): test patterns until clicking + diffusion exist ---
+        // --- Heat brush (Step 10) ---
+        ImGui::SeparatorText("Heat brush");
+        ImGui::TextDisabled("Right-click / right-drag on the mesh to heat it");
+        ImGui::SliderFloat("Radius", &brushRadius, 0.0f, 0.15f, "%.3f");
+        if (lastHit) {
+            ImGui::Text("Last hit: triangle %zu, vertex %u", lastHit->triangle,
+                        lastHit->nearestVertex);
+            ImGui::Text("  at (%.3f, %.3f, %.3f), distance %.3f", lastHit->point.x,
+                        lastHit->point.y, lastHit->point.z, lastHit->t);
+        } else {
+            ImGui::TextDisabled("No hit yet");
+        }
+
+        // --- Temperature (Step 8): test patterns ---
         ImGui::SeparatorText("Temperature");
         ImGui::Checkbox("Show temperature", &showTemperature);
-        // 'dirty' = the CPU copy changed and the GPU copy is now out of date.
-        bool temperatureDirty = false;
         if (ImGui::Button("All cold")) {
             std::fill(temperature.begin(), temperature.end(), 0.0f);
             temperatureDirty = true;
@@ -385,13 +460,6 @@ int main() {
         ImGui::SameLine();  // put the next widget on the same row
         if (ImGui::Button("Height gradient")) {
             fillHeightGradient(mesh, temperature);
-            temperatureDirty = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Heat selected")) {
-            temperature[selectedVertex] = 1.0f;
-            for (unsigned int nb : mesh.neighbors[selectedVertex])
-                temperature[nb] = 1.0f;
             temperatureDirty = true;
         }
         ImGui::Checkbox("Animate wave", &animateWave);
@@ -419,8 +487,6 @@ int main() {
         ImGui::End();
 
         // --- Render ---
-        int w, h;
-        glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
         glClearColor(clearColor[0], clearColor[1], clearColor[2], 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -429,15 +495,6 @@ int main() {
         // Without it, faces are drawn in index order and back faces can cover front ones.
         // (Enabled every frame because ImGui's renderer toggles GL state too.)
         glEnable(GL_DEPTH_TEST);
-
-        // --- The 3 matrices (see shaders/mesh.vert for how they're combined) ---
-        // Model: object space -> world space. Spin around the vertical (Y) axis.
-        glm::mat4 model = glm::rotate(glm::mat4(1.0f), glm::radians(angle),
-                                      glm::vec3(0.0f, 1.0f, 0.0f));
-        // View and projection now come from the camera object (see camera.cpp).
-        float aspect = (h > 0) ? static_cast<float>(w) / h : 1.0f;  // h is 0 when minimized
-        glm::mat4 view       = camera.viewMatrix();
-        glm::mat4 projection = camera.projectionMatrix(aspect);
 
         // Draw the mesh (before the UI, so the UI draws on top)
         glUseProgram(program);

@@ -51,7 +51,7 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC glfw)
 
-add_executable(HeatMesh src/main.cpp src/shader.cpp src/camera.cpp src/mesh.cpp)
+add_executable(HeatMesh src/main.cpp src/shader.cpp src/camera.cpp src/mesh.cpp src/picking.cpp)
 target_link_libraries(HeatMesh PRIVATE glad glfw glm::glm imgui tinyobjloader)
 
 # Lets the program find assets/ and shaders/ no matter where CLion runs it from
