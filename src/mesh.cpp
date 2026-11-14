@@ -4,18 +4,35 @@
 
 #include <tiny_obj_loader.h>
 
-#include <algorithm>  // std::max, std::sort, std::unique
+#include <algorithm>   // std::max, std::sort, std::unique
 #include <cstdio>
+#include <filesystem>  // std::filesystem::u8path
+#include <fstream>
+#include <sstream>
 
-bool loadObj(const std::string& path, Mesh& mesh) {
+bool loadObj(const std::string& path, Mesh& mesh, std::string& error) {
+    // Read the file ourselves instead of tinyobj's ParseFromFile(path): paths from
+    // the file dialog are UTF-8, and on Windows a plain std::string path breaks on
+    // accents ("C:/Users/Hélène/..."). u8path says "this text is UTF-8", and the
+    // filesystem library converts it to the form Windows expects.
+    std::ifstream file(std::filesystem::u8path(path), std::ios::binary);
+    if (!file) {
+        error = "Can't open the file.";
+        return false;
+    }
+    std::stringstream text;
+    text << file.rdbuf();
+
     tinyobj::ObjReaderConfig config;
     config.triangulate = true;  // split quads/polygons into triangles
 
     tinyobj::ObjReader reader;
-    if (!reader.ParseFromFile(path, config)) {
-        std::fprintf(stderr, "Failed to load %s: %s\n", path.c_str(), reader.Error().c_str());
+    // 2nd argument = contents of the .mtl material file; we don't use materials.
+    if (!reader.ParseFromString(text.str(), "", config)) {
+        error = "Not a valid .obj: " + reader.Error();
         return false;
     }
+    // Warnings (e.g. "material not found") are harmless for us: print, don't fail.
     if (!reader.Warning().empty())
         std::fprintf(stderr, "OBJ warning (%s): %s\n", path.c_str(), reader.Warning().c_str());
 
@@ -38,13 +55,25 @@ bool loadObj(const std::string& path, Mesh& mesh) {
     mesh.indices.clear();
     for (const auto& shape : shapes) {               // range-based for: "for each shape in shapes"
         for (const auto& idx : shape.mesh.indices) {
+            // A broken file can reference a vertex that doesn't exist (or none: -1).
+            // Using it later would read outside 'positions', so reject the file now.
+            if (idx.vertex_index < 0 ||
+                static_cast<size_t>(idx.vertex_index) >= mesh.positions.size()) {
+                error = "The file references a vertex that doesn't exist.";
+                return false;
+            }
             mesh.indices.push_back(static_cast<unsigned int>(idx.vertex_index));
         }
     }
 
+    if (mesh.indices.empty() || mesh.indices.size() % 3 != 0) {
+        error = "The file contains no triangles (only points or lines?).";
+        return false;
+    }
+
     std::printf("Loaded %s: %zu vertices, %zu triangles\n",
                 path.c_str(), mesh.vertexCount(), mesh.triangleCount());
-    return !mesh.positions.empty() && !mesh.indices.empty();
+    return true;
 }
 
 void normalizeToUnitBox(Mesh& mesh) {

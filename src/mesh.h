@@ -30,8 +30,10 @@ struct Mesh {
 };
 
 // Loads the triangles of an .obj file (positions only; normals/UVs are ignored).
-// Returns false and prints an error if the file can't be read.
-bool loadObj(const std::string& path, Mesh& mesh);
+// 'path' is UTF-8 (works with accents on Windows too). On failure, returns false
+// and puts a human-readable reason in 'error'; 'mesh' may then be half-filled,
+// so callers should load into a temporary Mesh.
+bool loadObj(const std::string& path, Mesh& mesh, std::string& error);
 
 // Moves and scales the mesh so it's centered on the origin and fits in a
 // box of size 1 on its longest side. Different .obj files use wildly different
